@@ -1,0 +1,311 @@
+import os
+import uuid
+import logging
+from openai import OpenAI
+from moviepy import VideoFileClip
+from pypdf import PdfReader
+
+import sounddevice as sd
+import soundfile as sf
+
+from google import genai
+try:
+    from langchain_tavily import TavilySearch
+except ImportError:
+    TavilySearch = None
+
+# -----------------------------
+# 🔐 CONFIG (USE ENV VARIABLES)
+# -----------------------------
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+GEMINI_API_KEY = "AIzaSyBOqy8tOiiZQxdcsnZ9hvpypgLkvaO00PI"
+
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "").strip()
+tavily_tool = None
+if TAVILY_API_KEY and TavilySearch is not None:
+    tavily_tool = TavilySearch(
+        max_results=5,
+        topic="general"
+    )
+else:
+    logging.warning("Tavily web search is unavailable. Set TAVILY_API_KEY and install langchain_tavily.")
+
+client = OpenAI(api_key=OPENAI_API_KEY)
+gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+logging.basicConfig(level=logging.INFO)
+
+
+# =============================
+# 📄 PDF AGENT
+# =============================
+def read_pdf(file_path):
+    reader = PdfReader(file_path)
+    text = ""
+    for page in reader.pages:
+        text += page.extract_text() or ""
+    return text
+
+
+def split_text(text):
+    chunk_size = 2000
+    chunk_overlap = 200
+    cleaned = " ".join(text.split())
+    if not cleaned:
+        return []
+
+    chunks = []
+    start = 0
+    text_len = len(cleaned)
+
+    while start < text_len:
+        end = min(start + chunk_size, text_len)
+        chunk = cleaned[start:end]
+
+        if end < text_len:
+            split_point = max(chunk.rfind(". "), chunk.rfind(" "))
+            if split_point > chunk_size // 2:
+                end = start + split_point + 1
+                chunk = cleaned[start:end]
+
+        chunks.append(chunk.strip())
+
+        if end >= text_len:
+            break
+
+        start = max(0, end - chunk_overlap)
+
+    return [part for part in chunks if part]
+
+
+def pdf_to_speech(file_path, output_file="output.wav"):
+    text = read_pdf(file_path)
+    chunks = split_text(text)
+
+    with open(output_file, "wb") as out:
+        for chunk in chunks:
+            response = client.audio.speech.create(
+                model="gpt-4o-mini-tts",
+                voice="alloy",
+                input=chunk
+            )
+            out.write(response.read())
+
+    return output_file
+
+
+# =============================
+# 🖼️ IMAGE AGENT (GEMINI)
+# =============================
+def ask_image(image_path, question):
+    if gemini_client is None:
+        raise ValueError("GEMINI_API_KEY is not set. Image agent is unavailable.")
+
+    uploaded_file = gemini_client.files.upload(file=image_path)
+
+    response = gemini_client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=[uploaded_file, question]
+    )
+
+    return response.text
+
+
+# =============================
+# 🎥 VIDEO AGENT
+# =============================
+def extract_audio(video_path, output_audio="audio.mp3"):
+    video = VideoFileClip(video_path)
+    video.audio.write_audiofile(output_audio)
+    return output_audio
+
+
+def transcribe(audio_file):
+    with open(audio_file, "rb") as f:
+        transcript = client.audio.transcriptions.create(
+            model="gpt-4o-transcribe",
+            file=f
+        )
+    return transcript.text
+
+
+def generate_report(transcript):
+    prompt = f"""
+    Convert into professional report:
+
+    - Title
+    - Summary
+    - Key Points
+    - Decisions
+    - Risks
+
+    Transcript:
+    {transcript}
+    """
+
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.3
+    )
+
+    return response.choices[0].message.content
+
+
+def video_pipeline(video_path):
+    audio = extract_audio(video_path)
+    transcript = transcribe(audio)
+
+    with open("transcript.txt", "w", encoding="utf-8") as f:
+        f.write(transcript)
+
+    report = generate_report(transcript)
+
+    with open("report.txt", "w", encoding="utf-8") as f:
+        f.write(report)
+
+    return {
+        "transcript": "transcript.txt",
+        "report": "report.txt"
+    }
+
+
+# =============================
+# 🎙️ SPEECH AGENT
+# =============================
+def record_audio(duration=10, samplerate=16000):
+    audio_data = sd.rec(int(duration * samplerate), samplerate=samplerate, channels=1)
+    sd.wait()
+
+    filename = f"mic_{uuid.uuid4().hex}.wav"
+    sf.write(filename, audio_data, samplerate)
+    return filename
+
+
+def speech_to_text(audio_file):
+    with open(audio_file, "rb") as audio:
+        transcript = client.audio.transcriptions.create(
+            model="gpt-4o-transcribe",
+            file=audio
+        )
+    return transcript.text
+
+
+# =============================
+# 🌐 WEB AGENT
+# =============================
+# -----------------------------
+# 🌐 WEB AGENT (IMPROVED)
+# -----------------------------
+def web_search(query):
+    if tavily_tool is None:
+        return "Web search is unavailable because TAVILY_API_KEY is not set."
+
+    try:
+        result = tavily_tool.invoke({"query": query})
+        results = result.get("results", [])
+
+        if not results:
+            return "No relevant web results found."
+
+        # Combine results cleanly
+        formatted = []
+        for i, item in enumerate(results, 1):
+            content = item.get("content", "")
+            url = item.get("url", "")
+
+            formatted.append(f"{i}. {content}\nSource: {url}")
+
+        return "\n\n".join(formatted)
+
+    except Exception as e:
+        return f"Web search error: {str(e)}"
+
+
+# =============================
+# 💬 GENERAL CHAT AGENT
+# =============================
+def chat_llm(prompt):
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[{"role": "user", "content": prompt}]
+    )
+    return response.choices[0].message.content
+
+
+# =============================
+# 🧠 ROUTER AGENT
+# =============================
+def router(user_input=None, file_path=None):
+    if file_path:
+        if file_path.endswith(".pdf"):
+            return "pdf"
+        elif file_path.endswith((".png", ".jpg", ".jpeg")):
+            return "image"
+        elif file_path.endswith(".mp4"):
+            return "video"
+        elif file_path.endswith((".wav", ".mp3", ".m4a", ".aac", ".flac", ".ogg", ".webm")):
+            return "audio"
+
+    if user_input:
+        text = user_input.lower()
+
+        if "search" in text or "latest" in text:
+            return "web"
+        elif "report" in text:
+            return "video"
+        else:
+            return "chat"
+
+    return "chat"
+
+
+# =============================
+# 🚀 MAIN PIPELINE
+# =============================
+def handle_request(user_input=None, file_path=None):
+    try:
+        agent = router(user_input, file_path)
+        logging.info(f"Using agent: {agent}")
+
+        if agent == "pdf":
+            return pdf_to_speech(file_path)
+
+        elif agent == "image":
+            return ask_image(file_path, user_input or "Explain this image")
+
+        elif agent == "video":
+            return video_pipeline(file_path)
+
+        elif agent == "audio":
+            return speech_to_text(file_path)
+
+        elif agent == "web":
+            return web_search(user_input)
+
+        elif agent == "chat":
+            return chat_llm(user_input)
+
+    except Exception as e:
+        logging.error(str(e))
+        return f"Error: {str(e)}"
+
+
+# =============================
+# ▶️ EXAMPLES
+# =============================
+if __name__ == "__main__":
+
+    # Example 1: PDF
+    #print(handle_request(file_path="Enterprise Supply Chain Performance Report 2025.pdf"))
+
+    # Example 2: Image
+    #print(handle_request("Explain this", "sample_image.png"))
+
+    # Example 3: Video
+    #print(handle_request(file_path="sample_video.mp4"))
+
+    # Example 4: Web
+    #print(handle_request("latest supply chain trends"))
+
+    # Example 5: Chat
+    print(handle_request("Explain supply chain optimization"))
