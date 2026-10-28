@@ -18,7 +18,7 @@ except ImportError:
 # 🔐 CONFIG (USE ENV VARIABLES)
 # -----------------------------
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-GEMINI_API_KEY = "AIzaSyBOqy8tOiiZQxdcsnZ9hvpypgLkvaO00PI"
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "").strip()
 tavily_tool = None
